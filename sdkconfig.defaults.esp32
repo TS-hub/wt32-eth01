@@ -1,0 +1,15 @@
+# ESP32-spezifisch: maximaler Durchsatz
+
+# CPU auf 240 MHz
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Einzelkern-Modus: lwIP und iperf laufen seriell, IRAM-Optimierungen wirken stärker
+CONFIG_FREERTOS_UNICORE=y
+
+# Watchdogs während Benchmarks deaktivieren
+CONFIG_ESP_INT_WDT=n
+CONFIG_ESP_TASK_WDT_EN=n
+
+# IRAM-Optimierungen für maximalen Durchsatz
+CONFIG_LWIP_IRAM_OPTIMIZATION=y
+CONFIG_ETH_IRAM_OPTIMIZATION=y
