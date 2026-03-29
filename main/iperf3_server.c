@@ -464,6 +464,7 @@ static void iperf3_server_task(void *arg)
         printf("0.0-%.1f sec  %.2f Mbits/sec  (average)\n", dur, avg_bw);
         printf("%s %" PRIu64 " bytes in %.2f sec = %.2f Mbits/sec\n",
                reverse ? "Sent" : "Received", reported_bytes, dur, avg_bw);
+        oled_set_iperf3_result(avg_bw);
 
         free(buf); buf = NULL;
 

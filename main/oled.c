@@ -1,5 +1,5 @@
 /* SH1106 1.3" I2C OLED driver
- * SDA=GPIO16, SCL=GPIO17, I2C address 0x3C
+ * SDA=GPIO16, SCL=GPIO17, I2C address 0x3C or 0x3D (auto-detected)
  * 128x64 px, 5x7 font (6px pitch) → 21 chars × 8 lines
  *
  * Layout:
@@ -15,15 +15,16 @@
 #include <string.h>
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
-#include "driver/i2c_master.h"
+#include "driver/i2c.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "oled.h"
 
 #define TAG              "oled"
 #define OLED_SDA         16
 #define OLED_SCL         17
-#define OLED_ADDR        0x3C
 #define OLED_WIDTH       128
 #define OLED_PAGES       8
 #define CHAR_PITCH       6    /* 5px glyph + 1px gap */
@@ -132,40 +133,50 @@ static const uint8_t s_font[][5] = {
 
 /* ------------------------------------------------------------------ */
 
-static i2c_master_bus_handle_t s_bus;
-static i2c_master_dev_handle_t s_dev;
-static SemaphoreHandle_t       s_mutex;
+static bool              s_ready = false;
+static SemaphoreHandle_t s_mutex;
+static int               s_col_offset = COL_OFFSET;
+static uint8_t           s_addr = 0x3C;  /* updated by bus scan; also 0x3D */
 
 /* Framebuffer: [page][col] */
 static uint8_t s_fb[OLED_PAGES][OLED_WIDTH];
 
 /* State */
-static char s_ip[24]         = "---";
-static bool s_iperf3_active  = false;
+static char   s_ip[24]       = "---";
+static bool   s_iperf3_active = false;
+static double s_iperf3_mbps   = 0.0;
 
 /* ------------------------------------------------------------------ */
-/* Low-level I/O                                                        */
+/* Low-level I/O (legacy i2c driver)                                   */
 /* ------------------------------------------------------------------ */
 
 static void cmd(uint8_t c)
 {
-    uint8_t buf[2] = {0x00, c};
-    i2c_master_transmit(s_dev, buf, 2, pdMS_TO_TICKS(50));
+    i2c_cmd_handle_t h = i2c_cmd_link_create();
+    i2c_master_start(h);
+    i2c_master_write_byte(h, (s_addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(h, 0x00, true);   /* control: command */
+    i2c_master_write_byte(h, c,    true);
+    i2c_master_stop(h);
+    i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(50));
+    i2c_cmd_link_delete(h);
 }
 
 static void flush_page(int page)
 {
-    /* Set page address */
-    int col = COL_OFFSET;
+    int col = s_col_offset;
     cmd(0xB0 | (page & 0x07));
     cmd(0x00 | (col & 0x0F));
     cmd(0x10 | ((col >> 4) & 0x07));
 
-    /* Send 128 data bytes prefixed with 0x40 control byte */
-    static uint8_t tx[OLED_WIDTH + 1];
-    tx[0] = 0x40;
-    memcpy(tx + 1, s_fb[page], OLED_WIDTH);
-    i2c_master_transmit(s_dev, tx, OLED_WIDTH + 1, pdMS_TO_TICKS(100));
+    i2c_cmd_handle_t h = i2c_cmd_link_create();
+    i2c_master_start(h);
+    i2c_master_write_byte(h, (s_addr << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(h, 0x40, true);   /* control: data */
+    i2c_master_write(h, s_fb[page], OLED_WIDTH, true);
+    i2c_master_stop(h);
+    i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(h);
 }
 
 /* ------------------------------------------------------------------ */
@@ -197,7 +208,7 @@ static void redraw(void)
     fb_clear();
 
     /* Page 0 — title */
-    fb_puts(0, 0, "WT32-ETH01");
+    fb_puts(0, 8, "iperf test plug");
 
     /* Page 1 — separator line (pixel row 3 of the page) */
     memset(s_fb[1], 0x08, OLED_WIDTH);
@@ -205,13 +216,20 @@ static void redraw(void)
     /* Page 2 — Ethernet IP */
     char line[32];
     snprintf(line, sizeof(line), "ETH: %s", s_ip);
-    fb_puts(2, 0, line);
+    fb_puts(2, 8, line);
 
     /* Page 4 — WiFi AP SSID */
-    fb_puts(4, 0, "AP:  ESP32-ETH-Setup");
+    fb_puts(4, 8, "AP:  ESP32-ETH-Setup");
 
     /* Page 6 — iperf3 status */
-    fb_puts(6, 0, s_iperf3_active ? "iperf3: ACTIVE" : "iperf3: waiting");
+    char iperf_line[32];
+    if (s_iperf3_active)
+        snprintf(iperf_line, sizeof(iperf_line), "iperf3: running...");
+    else if (s_iperf3_mbps > 0)
+        snprintf(iperf_line, sizeof(iperf_line), "iperf3: %.1f Mb/s", s_iperf3_mbps);
+    else
+        snprintf(iperf_line, sizeof(iperf_line), "iperf3: waiting");
+    fb_puts(6, 8, iperf_line);
 
     for (int p = 0; p < OLED_PAGES; p++) flush_page(p);
 }
@@ -220,23 +238,28 @@ static void redraw(void)
 /* SH1106 init sequence                                                 */
 /* ------------------------------------------------------------------ */
 
-static void sh1106_init(void)
+/* Compatible init for both SSD1306 and SH1106.
+ * Uses 0x8D/0x14 charge pump (SSD1306) — SH1106 modules with external
+ * charge pump accept this; pure SH1106 internal-pump modules may need
+ * col_offset=2, but both are tried at startup. */
+static void oled_hw_init(void)
 {
-    cmd(0xAE);       /* display off */
-    cmd(0xD5); cmd(0x80); /* clock div */
-    cmd(0xA8); cmd(0x3F); /* mux 1:64  */
-    cmd(0xD3); cmd(0x00); /* display offset = 0 */
-    cmd(0x40);            /* start line 0 */
-    cmd(0xAD); cmd(0x8B); /* DC-DC on (SH1106 internal) */
-    cmd(0xA1);            /* seg remap: col 131 → SEG0 */
-    cmd(0xC8);            /* COM scan: reverse */
-    cmd(0xDA); cmd(0x12); /* COM pins */
-    cmd(0x81); cmd(0xFF); /* contrast max */
-    cmd(0xD9); cmd(0x1F); /* pre-charge */
-    cmd(0xDB); cmd(0x40); /* VCOMH */
-    cmd(0xA4);            /* display from RAM */
-    cmd(0xA6);            /* normal (not inverted) */
-    cmd(0xAF);            /* display on */
+    cmd(0xAE);            /* display off              */
+    cmd(0xD5); cmd(0x80); /* clock / osc freq         */
+    cmd(0xA8); cmd(0x3F); /* mux ratio 1:64           */
+    cmd(0xD3); cmd(0x00); /* display offset = 0       */
+    cmd(0x40);            /* start line 0             */
+    cmd(0x8D); cmd(0x14); /* charge pump ON (SSD1306 / SH1106-ext) */
+    cmd(0x20); cmd(0x02); /* page addressing mode     */
+    cmd(0xA1);            /* seg remap                */
+    cmd(0xC8);            /* COM scan reverse         */
+    cmd(0xDA); cmd(0x12); /* COM pins config          */
+    cmd(0x81); cmd(0xCF); /* contrast                 */
+    cmd(0xD9); cmd(0xF1); /* pre-charge               */
+    cmd(0xDB); cmd(0x40); /* VCOMH deselect level     */
+    cmd(0xA4);            /* display from RAM         */
+    cmd(0xA6);            /* normal (not inverted)    */
+    cmd(0xAF);            /* display on               */
 }
 
 /* ------------------------------------------------------------------ */
@@ -247,51 +270,78 @@ void oled_init(void)
 {
     s_mutex = xSemaphoreCreateMutex();
 
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port             = I2C_NUM_0,
-        .sda_io_num           = OLED_SDA,
-        .scl_io_num           = OLED_SCL,
-        .clk_source           = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt    = 7,
-        .flags.enable_internal_pullup = true,
+    /* Legacy I2C driver — more compatible with SSD1306/SH1106 than new master API */
+    i2c_config_t cfg = {
+        .mode             = I2C_MODE_MASTER,
+        .sda_io_num       = OLED_SDA,
+        .scl_io_num       = OLED_SCL,
+        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000,
     };
-    if (i2c_new_master_bus(&bus_cfg, &s_bus) != ESP_OK) {
-        ESP_LOGE(TAG, "I2C bus init failed");
+    if (i2c_param_config(I2C_NUM_0, &cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "i2c_param_config failed");
+        return;
+    }
+    if (i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0) != ESP_OK) {
+        ESP_LOGE(TAG, "i2c_driver_install failed");
         return;
     }
 
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = OLED_ADDR,
-        .scl_speed_hz    = 400000,
-    };
-    if (i2c_master_bus_add_device(s_bus, &dev_cfg, &s_dev) != ESP_OK) {
-        ESP_LOGE(TAG, "OLED device add failed");
+    /* Bus scan */
+    ESP_LOGI(TAG, "Scanning I2C bus (SDA=%d SCL=%d)...", OLED_SDA, OLED_SCL);
+    uint8_t found = 0;
+    for (uint8_t a = 0x08; a < 0x78; a++) {
+        i2c_cmd_handle_t h = i2c_cmd_link_create();
+        i2c_master_start(h);
+        i2c_master_write_byte(h, (a << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(h);
+        esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, h, pdMS_TO_TICKS(10));
+        i2c_cmd_link_delete(h);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "  Device at 0x%02X", a);
+            found = a;
+        }
+    }
+    if (!found) {
+        ESP_LOGE(TAG, "I2C bus empty — no device responded");
+        i2c_driver_delete(I2C_NUM_0);
         return;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(50)); /* wait for display power-up */
-    sh1106_init();
+    s_addr = found;
+    vTaskDelay(pdMS_TO_TICKS(100));
+    oled_hw_init();
+    s_col_offset = COL_OFFSET;
+    s_ready = true;
     redraw();
-    ESP_LOGI(TAG, "OLED ready");
+    ESP_LOGI(TAG, "OLED ready at 0x%02X (col_offset=%d)", found, s_col_offset);
 }
 
 void oled_set_eth_ip(const char *ip)
 {
+    if (!s_ready) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (ip && *ip) {
-        strlcpy(s_ip, ip, sizeof(s_ip));
-    } else {
-        strlcpy(s_ip, "---", sizeof(s_ip));
-    }
+    strlcpy(s_ip, (ip && *ip) ? ip : "---", sizeof(s_ip));
     redraw();
     xSemaphoreGive(s_mutex);
 }
 
 void oled_set_iperf3_active(bool active)
 {
+    if (!s_ready) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_iperf3_active = active;
+    redraw();
+    xSemaphoreGive(s_mutex);
+}
+
+void oled_set_iperf3_result(double mbps)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_iperf3_active = false;
+    s_iperf3_mbps   = mbps;
     redraw();
     xSemaphoreGive(s_mutex);
 }

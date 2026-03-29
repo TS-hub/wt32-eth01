@@ -6,3 +6,4 @@
 void oled_init(void);
 void oled_set_eth_ip(const char *ip);       /* NULL/"" = show "---" */
 void oled_set_iperf3_active(bool active);
+void oled_set_iperf3_result(double mbps);   /* show throughput after test */
