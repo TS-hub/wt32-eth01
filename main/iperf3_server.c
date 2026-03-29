@@ -419,16 +419,19 @@ static void iperf3_server_task(void *arg)
 
         cJSON *srv_res = cJSON_CreateObject();
         cJSON *streams_arr = cJSON_AddArrayToObject(srv_res, "streams");
-        cJSON *s0 = cJSON_CreateObject();
-        cJSON_AddNumberToObject(s0, "id",             1);
-        cJSON_AddNumberToObject(s0, "bytes",          (double)total_bytes);
-        cJSON_AddNumberToObject(s0, "retransmits",    0);
-        cJSON_AddNumberToObject(s0, "jitter",         0.0);
-        cJSON_AddNumberToObject(s0, "errors",         0);
-        cJSON_AddNumberToObject(s0, "packets",        0);
-        cJSON_AddNumberToObject(s0, "start_time",     0.0);
-        cJSON_AddNumberToObject(s0, "end_time",       dur);
-        cJSON_AddItemToArray(streams_arr, s0);
+        double bytes_per_stream = (double)total_bytes / (n_streams > 0 ? n_streams : 1);
+        for (int i = 0; i < n_streams; i++) {
+            cJSON *si = cJSON_CreateObject();
+            cJSON_AddNumberToObject(si, "id",          i + 1);
+            cJSON_AddNumberToObject(si, "bytes",       bytes_per_stream);
+            cJSON_AddNumberToObject(si, "retransmits", 0);
+            cJSON_AddNumberToObject(si, "jitter",      0.0);
+            cJSON_AddNumberToObject(si, "errors",      0);
+            cJSON_AddNumberToObject(si, "packets",     0);
+            cJSON_AddNumberToObject(si, "start_time",  0.0);
+            cJSON_AddNumberToObject(si, "end_time",    dur);
+            cJSON_AddItemToArray(streams_arr, si);
+        }
         cJSON_AddNumberToObject(srv_res, "cpu_util_total",  0.0);
         cJSON_AddNumberToObject(srv_res, "cpu_util_user",   0.0);
         cJSON_AddNumberToObject(srv_res, "cpu_util_system", 0.0);
@@ -470,7 +473,7 @@ esp_err_t iperf3_server_start(void)
     s_running = true;
     BaseType_t r = xTaskCreatePinnedToCore(
         iperf3_server_task, "iperf3_srv",
-        8192, NULL, 5, NULL, 1);
+        12288, NULL, 5, NULL, 1);
     if (r != pdPASS) {
         s_running = false;
         ESP_LOGE(TAG, "task create failed");
