@@ -4,14 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Projekt
 
-ESP-IDF (v5.4) Projekt für das **Waveshare ESP32-S3-ETH** (ESP32-S3 + W5500 SPI-Ethernet) als iperf-Benchmark-Station.
+ESP-IDF (v5.5.4) Projekt für das **Waveshare ESP32-S3-ETH** (ESP32-S3 + W5500 SPI-Ethernet) als iperf-Benchmark-Station.
 Implementiert das iperf**2**-Protokoll (kompatibel mit `iperf`, nicht `iperf3`).
 
 ## Build & Flash
 
 ```bash
 # ESP-IDF Umgebung laden (WSL/bash)
-. /mnt/c/Users/Thomas/esp/v5.4/esp-idf/export.sh
+. ~/esp/esp-idf/export.sh
 
 # Erstmalig: Target setzen und bauen
 rm -rf build sdkconfig
