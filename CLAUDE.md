@@ -18,8 +18,13 @@ rm -rf build sdkconfig
 idf.py set-target esp32s3
 idf.py build
 
-# Flashen und Monitor
-idf.py -p /dev/ttyS3 flash monitor   # COM3 in WSL
+# Flashen (WSL2 kann ttyS* nicht konfigurieren → Windows Python nutzen)
+cd build && /mnt/c/Users/Thomas/.espressif/python_env/idf5.4_py3.11_env/Scripts/python.exe \
+  -m esptool --chip esp32s3 -p COM3 -b 460800 --before default_reset --after hard_reset \
+  write_flash @flash_args
+
+# Monitor (funktioniert mit ttyS3 da nur lesen)
+idf.py -p /dev/ttyS3 monitor
 ```
 
 ## Projektstruktur
