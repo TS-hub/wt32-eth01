@@ -377,26 +377,25 @@ static void iperf3_server_task(void *arg)
         }
 
         int64_t t_end = get_us();
+        uint64_t reported_bytes = total_bytes;
 
-        /* Drain any residual data (don't count this time in duration) */
+        /* Drain any residual data (close sockets cleanly, don't add to reported bytes) */
         tv = (struct timeval){ .tv_sec = 2, .tv_usec = 0 };
         for (int i = 0; i < n_data; i++) {
             if (data_fd[i] < 0) continue;
             setsockopt(data_fd[i], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             int n;
-            while ((n = recv(data_fd[i], buf, blksize, 0)) > 0) {
-                total_bytes += (uint64_t)n;
-            }
+            while ((n = recv(data_fd[i], buf, blksize, 0)) > 0) {}
             close(data_fd[i]); data_fd[i] = -1;
         }
         n_data = 0;
         double  dur   = (t_end - t_start) / 1e6;
         if (dur <= 0) dur = 0.001;
-        double avg_bw = (total_bytes * 8.0) / dur / 1e6;
+        double avg_bw = (reported_bytes * 8.0) / dur / 1e6;
 
         printf("0.0-%.1f sec  %.2f Mbits/sec  (average)\n", dur, avg_bw);
         printf("Received %" PRIu64 " bytes in %.2f sec = %.2f Mbits/sec\n",
-               total_bytes, dur, avg_bw);
+               reported_bytes, dur, avg_bw);
 
         free(buf); buf = NULL;
 
@@ -436,7 +435,7 @@ static void iperf3_server_task(void *arg)
 
         cJSON *srv_res = cJSON_CreateObject();
         cJSON *streams_arr = cJSON_AddArrayToObject(srv_res, "streams");
-        double bytes_per_stream = (double)total_bytes / (n_streams > 0 ? n_streams : 1);
+        double bytes_per_stream = (double)reported_bytes / (n_streams > 0 ? n_streams : 1);
         for (int i = 0; i < n_streams; i++) {
             cJSON *si = cJSON_CreateObject();
             cJSON_AddNumberToObject(si, "id",          stream_ids[i]);
