@@ -415,14 +415,31 @@ static void iperf3_server_task(void *arg)
         if (send_state(ctrl_fd, ST_EXCHANGE_RESULTS) != 1) goto close_session;
 
         cJSON *cli_res = recv_json(ctrl_fd);
-        if (cli_res) cJSON_Delete(cli_res);
+
+        /* Extract stream IDs from client results so we can mirror them back */
+        int stream_ids[IPERF3_MAX_STREAMS];
+        int n_ids = 0;
+        if (cli_res) {
+            cJSON *cli_streams = cJSON_GetObjectItem(cli_res, "streams");
+            cJSON *entry;
+            cJSON_ArrayForEach(entry, cli_streams) {
+                if (n_ids < IPERF3_MAX_STREAMS) {
+                    cJSON *id_j = cJSON_GetObjectItem(entry, "id");
+                    stream_ids[n_ids] = (id_j && cJSON_IsNumber(id_j)) ? id_j->valueint : (n_ids + 1);
+                    n_ids++;
+                }
+            }
+            cJSON_Delete(cli_res);
+        }
+        /* Fall back to sequential IDs if client results were missing */
+        for (int i = n_ids; i < n_streams; i++) stream_ids[i] = i + 1;
 
         cJSON *srv_res = cJSON_CreateObject();
         cJSON *streams_arr = cJSON_AddArrayToObject(srv_res, "streams");
         double bytes_per_stream = (double)total_bytes / (n_streams > 0 ? n_streams : 1);
         for (int i = 0; i < n_streams; i++) {
             cJSON *si = cJSON_CreateObject();
-            cJSON_AddNumberToObject(si, "id",          i + 1);
+            cJSON_AddNumberToObject(si, "id",          stream_ids[i]);
             cJSON_AddNumberToObject(si, "bytes",       bytes_per_stream);
             cJSON_AddNumberToObject(si, "retransmits", 0);
             cJSON_AddNumberToObject(si, "jitter",      0.0);
