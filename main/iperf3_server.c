@@ -376,7 +376,9 @@ static void iperf3_server_task(void *arg)
             }
         }
 
-        /* Drain any residual data */
+        int64_t t_end = get_us();
+
+        /* Drain any residual data (don't count this time in duration) */
         tv = (struct timeval){ .tv_sec = 2, .tv_usec = 0 };
         for (int i = 0; i < n_data; i++) {
             if (data_fd[i] < 0) continue;
@@ -388,8 +390,6 @@ static void iperf3_server_task(void *arg)
             close(data_fd[i]); data_fd[i] = -1;
         }
         n_data = 0;
-
-        int64_t t_end = get_us();
         double  dur   = (t_end - t_start) / 1e6;
         if (dur <= 0) dur = 0.001;
         double avg_bw = (total_bytes * 8.0) / dur / 1e6;
