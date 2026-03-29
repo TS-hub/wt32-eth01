@@ -204,11 +204,8 @@ static void iperf3_server_task(void *arg)
         cookie[IPERF3_COOKIE_SIZE - 1] = '\0';
         ESP_LOGI(TAG, "Cookie: %.36s", cookie);
 
-        /* --- 2. Receive PARAM_EXCHANGE + JSON --- */
-        if (recv_state(ctrl_fd, &state) != 1 || state != ST_PARAM_EXCHANGE) {
-            ESP_LOGE(TAG, "Expected PARAM_EXCHANGE, got %d", state);
-            goto close_session;
-        }
+        /* --- 2. Send PARAM_EXCHANGE, receive JSON params from client --- */
+        if (send_state(ctrl_fd, ST_PARAM_EXCHANGE) != 1) goto close_session;
         cJSON *params = recv_json(ctrl_fd);
         if (!params) { ESP_LOGE(TAG, "params JSON failed"); goto close_session; }
 
@@ -255,10 +252,7 @@ static void iperf3_server_task(void *arg)
             goto close_session;
         }
 
-        /* --- 3. Ack PARAM_EXCHANGE --- */
-        if (send_state(ctrl_fd, ST_PARAM_EXCHANGE) != 1) goto close_session;
-
-        /* --- 4. Send CREATE_STREAMS --- */
+        /* --- 3. Send CREATE_STREAMS --- */
         if (send_state(ctrl_fd, ST_CREATE_STREAMS) != 1) goto close_session;
 
         /* --- 5. Accept data streams (same listen socket, identified by cookie) --- */
