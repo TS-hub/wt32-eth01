@@ -8,6 +8,7 @@ ESP-IDF firmware for the [Waveshare ESP32-S3-ETH](https://www.waveshare.com/wiki
 - **iperf2 server/client** — full `iperf` command on the serial console (TCP + UDP, reverse mode)
 - **WiFi captive portal** — open AP `ESP32-ETH-Setup` on boot, configure static IP or DHCP via browser at `http://192.168.4.1`
 - **Static IP persistence** — settings stored in NVS, survive reboots
+- **1.3" OLED display** — shows Ethernet IP and live iperf3 status/throughput
 
 ## Hardware
 
@@ -28,6 +29,15 @@ ESP-IDF firmware for the [Waveshare ESP32-S3-ETH](https://www.waveshare.com/wiki
 | CS     | 14   |
 | INT    | 10   |
 | RST    | 9    |
+
+### OLED Display (SH1106 1.3", I2C)
+
+| Signal | GPIO |
+|--------|------|
+| SDA    | 16   |
+| SCL    | 17   |
+
+I2C address auto-detected (0x3C or 0x3D). Display shows Ethernet IP and iperf3 status.
 
 ## Requirements
 
@@ -112,6 +122,7 @@ main/
   main.c            — app entry, Ethernet init, console setup
   iperf3_server.c   — iperf3 wire protocol implementation (TCP receive)
   wifi_config.c     — WiFi AP + captive portal + NVS IP config
+  oled.c / oled.h   — SH1106 I2C OLED driver (128×64, built-in font)
 sdkconfig.defaults          — W5500 SPI pin config, Ethernet settings
 sdkconfig.defaults.esp32s3  — dual-core, IRAM, 240 MHz, watchdogs off
 main/idf_component.yml      — dependencies: ethernet_init, iperf-cmd, cmd_system
