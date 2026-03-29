@@ -241,11 +241,7 @@ static void iperf3_server_task(void *arg)
                  n_streams, test_time, blksize, udp, reverse, omit, interval);
         cJSON_Delete(params);
 
-        if (reverse) {
-            ESP_LOGW(TAG, "Reverse mode not supported");
-            send_state(ctrl_fd, ST_ACCESS_DENIED);
-            goto close_session;
-        }
+        /* reverse mode supported — server sends, client receives */
         if (udp) {
             ESP_LOGW(TAG, "UDP mode not supported");
             send_state(ctrl_fd, ST_ACCESS_DENIED);
@@ -282,20 +278,14 @@ static void iperf3_server_task(void *arg)
         if (send_state(ctrl_fd, ST_TEST_START)   != 1) goto close_session;
         if (send_state(ctrl_fd, ST_TEST_RUNNING) != 1) goto close_session;
 
-        /* --- 7. Receive data --- */
+        /* --- 7. Transfer data --- */
         buf = malloc(blksize);
         if (!buf) {
             send_state(ctrl_fd, ST_SERVER_ERROR);
             goto close_session;
         }
 
-        /* Set generous timeout on data sockets */
-        tv = (struct timeval){ .tv_sec = test_time + 10, .tv_usec = 0 };
-        for (int i = 0; i < n_data; i++) {
-            setsockopt(data_fd[i], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        }
-
-        /* Build fd_set */
+        /* Compute maxfd across ctrl + data sockets */
         int maxfd = ctrl_fd;
         for (int i = 0; i < n_data; i++) {
             if (data_fd[i] > maxfd) maxfd = data_fd[i];
@@ -313,93 +303,169 @@ static void iperf3_server_task(void *arg)
         if (omit > 0) printf("\nOmitting first %d second(s)...\n", omit);
         printf("\nInterval        Bandwidth\n");
 
-        while (streams_done < n_data && !ctrl_ended) {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(ctrl_fd, &rfds);
+        if (!reverse) {
+            /* Normal mode: receive data from client */
+            tv = (struct timeval){ .tv_sec = test_time + 10, .tv_usec = 0 };
             for (int i = 0; i < n_data; i++) {
-                if (data_fd[i] >= 0) FD_SET(data_fd[i], &rfds);
+                setsockopt(data_fd[i], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             }
 
-            /* Wake at next report boundary */
-            int64_t now   = get_us();
-            int64_t wake  = t_last_report + (int64_t)(interval * 1e6);
-            int64_t delay = wake - now;
-            if (delay < 10000)    delay = 10000;
-            if (delay > 2000000)  delay = 2000000;
-            tv.tv_sec  = (long)(delay / 1000000);
-            tv.tv_usec = (long)(delay % 1000000);
-
-            int sel = select(maxfd, &rfds, NULL, NULL, &tv);
-            if (sel < 0) { if (errno == EINTR) continue; break; }
-
-            /* Interval report */
-            now = get_us();
-            if (now - t_last_report >= (int64_t)(interval * 1e6)) {
-                double elapsed = (now - t_start) / 1e6;
-                double int_dur = (now - t_last_report) / 1e6;
-                if (elapsed >= (double)omit && int_dur > 0) {
-                    double bw  = (interval_bytes * 8.0) / int_dur / 1e6;
-                    double t0  = t_report_sec;
-                    t_report_sec = elapsed - omit;
-                    printf("%.1f-%.1f sec  %.2f Mbits/sec\n", t0, t_report_sec, bw);
+            while (streams_done < n_data && !ctrl_ended) {
+                fd_set rfds;
+                FD_ZERO(&rfds);
+                FD_SET(ctrl_fd, &rfds);
+                for (int i = 0; i < n_data; i++) {
+                    if (data_fd[i] >= 0) FD_SET(data_fd[i], &rfds);
                 }
-                interval_bytes  = 0;
-                t_last_report   = now;
-            }
 
-            if (sel == 0) continue;
+                int64_t now   = get_us();
+                int64_t wake  = t_last_report + (int64_t)(interval * 1e6);
+                int64_t delay = wake - now;
+                if (delay < 10000)   delay = 10000;
+                if (delay > 2000000) delay = 2000000;
+                tv.tv_sec  = (long)(delay / 1000000);
+                tv.tv_usec = (long)(delay % 1000000);
 
-            /* Control socket */
-            if (FD_ISSET(ctrl_fd, &rfds)) {
-                if (recv_state(ctrl_fd, &state) == 1) {
-                    if (state == ST_TEST_END || state == ST_CLIENT_TERMINATE) {
-                        ESP_LOGI(TAG, "Ctrl state %d received", state);
+                int sel = select(maxfd, &rfds, NULL, NULL, &tv);
+                if (sel < 0) { if (errno == EINTR) continue; break; }
+
+                now = get_us();
+                if (now - t_last_report >= (int64_t)(interval * 1e6)) {
+                    double elapsed = (now - t_start) / 1e6;
+                    double int_dur = (now - t_last_report) / 1e6;
+                    if (elapsed >= (double)omit && int_dur > 0) {
+                        double bw = (interval_bytes * 8.0) / int_dur / 1e6;
+                        double t0 = t_report_sec;
+                        t_report_sec = elapsed - omit;
+                        printf("%.1f-%.1f sec  %.2f Mbits/sec\n", t0, t_report_sec, bw);
+                    }
+                    interval_bytes = 0;
+                    t_last_report  = now;
+                }
+
+                if (sel == 0) continue;
+
+                if (FD_ISSET(ctrl_fd, &rfds)) {
+                    if (recv_state(ctrl_fd, &state) == 1) {
+                        if (state == ST_TEST_END || state == ST_CLIENT_TERMINATE) {
+                            ESP_LOGI(TAG, "Ctrl state %d received", state);
+                            ctrl_ended = true;
+                        }
+                    } else {
                         ctrl_ended = true;
                     }
-                } else {
-                    ctrl_ended = true;
+                }
+
+                for (int i = 0; i < n_data; i++) {
+                    if (data_fd[i] < 0 || !FD_ISSET(data_fd[i], &rfds)) continue;
+                    int n = recv(data_fd[i], buf, blksize, 0);
+                    if (n <= 0) {
+                        close(data_fd[i]); data_fd[i] = -1;
+                        streams_done++;
+                    } else {
+                        total_bytes    += (uint64_t)n;
+                        interval_bytes += (uint64_t)n;
+                    }
                 }
             }
 
-            /* Data sockets */
-            for (int i = 0; i < n_data; i++) {
-                if (data_fd[i] < 0 || !FD_ISSET(data_fd[i], &rfds)) continue;
-                int n = recv(data_fd[i], buf, blksize, 0);
-                if (n <= 0) {
-                    close(data_fd[i]); data_fd[i] = -1;
-                    streams_done++;
-                } else {
-                    total_bytes    += (uint64_t)n;
-                    interval_bytes += (uint64_t)n;
+        } else {
+            /* Reverse mode: server sends data for test_time seconds */
+            memset(buf, 0x5A, blksize);
+            int64_t t_deadline = t_start + (int64_t)test_time * 1000000LL;
+
+            while (!ctrl_ended) {
+                int64_t now = get_us();
+                if (now >= t_deadline) break;
+
+                fd_set rfds, wfds;
+                FD_ZERO(&rfds); FD_ZERO(&wfds);
+                FD_SET(ctrl_fd, &rfds);
+                bool any_open = false;
+                for (int i = 0; i < n_data; i++) {
+                    if (data_fd[i] >= 0) {
+                        FD_SET(data_fd[i], &wfds);
+                        any_open = true;
+                    }
+                }
+                if (!any_open) break;
+
+                int64_t remaining = t_deadline - now;
+                if (remaining > 100000) remaining = 100000;
+                tv.tv_sec  = 0;
+                tv.tv_usec = (long)remaining;
+
+                int sel = select(maxfd, &rfds, &wfds, NULL, &tv);
+                if (sel < 0) { if (errno == EINTR) continue; break; }
+
+                if (FD_ISSET(ctrl_fd, &rfds)) {
+                    if (recv_state(ctrl_fd, &state) == 1 &&
+                        (state == ST_CLIENT_TERMINATE || state == ST_TEST_END)) {
+                        ctrl_ended = true; break;
+                    }
+                }
+
+                for (int i = 0; i < n_data; i++) {
+                    if (data_fd[i] < 0 || !FD_ISSET(data_fd[i], &wfds)) continue;
+                    int n = send(data_fd[i], buf, blksize, 0);
+                    if (n > 0) {
+                        total_bytes    += (uint64_t)n;
+                        interval_bytes += (uint64_t)n;
+                    } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                        ESP_LOGW(TAG, "send stream %d: %s", i, strerror(errno));
+                        close(data_fd[i]); data_fd[i] = -1;
+                    }
+                }
+
+                now = get_us();
+                if (now - t_last_report >= (int64_t)(interval * 1e6)) {
+                    double elapsed = (now - t_start) / 1e6;
+                    double int_dur = (now - t_last_report) / 1e6;
+                    if (elapsed >= (double)omit && int_dur > 0) {
+                        double bw = (interval_bytes * 8.0) / int_dur / 1e6;
+                        double t0 = t_report_sec;
+                        t_report_sec = elapsed - omit;
+                        printf("%.1f-%.1f sec  %.2f Mbits/sec\n", t0, t_report_sec, bw);
+                    }
+                    interval_bytes = 0;
+                    t_last_report  = now;
                 }
             }
+
+            /* Close data sockets — signals EOF to client */
+            for (int i = 0; i < n_data; i++) {
+                if (data_fd[i] >= 0) { close(data_fd[i]); data_fd[i] = -1; }
+            }
+            n_data = 0;
         }
 
         int64_t t_end = get_us();
         uint64_t reported_bytes = total_bytes;
 
-        /* Drain any residual data (close sockets cleanly, don't add to reported bytes) */
-        tv = (struct timeval){ .tv_sec = 2, .tv_usec = 0 };
-        for (int i = 0; i < n_data; i++) {
-            if (data_fd[i] < 0) continue;
-            setsockopt(data_fd[i], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            int n;
-            while ((n = recv(data_fd[i], buf, blksize, 0)) > 0) {}
-            close(data_fd[i]); data_fd[i] = -1;
+        /* Drain residual data (normal mode only) */
+        if (!reverse) {
+            tv = (struct timeval){ .tv_sec = 2, .tv_usec = 0 };
+            for (int i = 0; i < n_data; i++) {
+                if (data_fd[i] < 0) continue;
+                setsockopt(data_fd[i], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                int n;
+                while ((n = recv(data_fd[i], buf, blksize, 0)) > 0) {}
+                close(data_fd[i]); data_fd[i] = -1;
+            }
+            n_data = 0;
         }
-        n_data = 0;
+
         double  dur   = (t_end - t_start) / 1e6;
         if (dur <= 0) dur = 0.001;
         double avg_bw = (reported_bytes * 8.0) / dur / 1e6;
 
         printf("0.0-%.1f sec  %.2f Mbits/sec  (average)\n", dur, avg_bw);
-        printf("Received %" PRIu64 " bytes in %.2f sec = %.2f Mbits/sec\n",
-               reported_bytes, dur, avg_bw);
+        printf("%s %" PRIu64 " bytes in %.2f sec = %.2f Mbits/sec\n",
+               reverse ? "Sent" : "Received", reported_bytes, dur, avg_bw);
 
         free(buf); buf = NULL;
 
-        /* Wait for TEST_END if ctrl hasn't sent it yet */
+        /* Wait for TEST_END if not yet received */
         if (!ctrl_ended) {
             tv = (struct timeval){ .tv_sec = 5, .tv_usec = 0 };
             setsockopt(ctrl_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
