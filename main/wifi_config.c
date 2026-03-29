@@ -23,6 +23,7 @@
 #include "esp_netif.h"
 #include "esp_http_server.h"
 #include "nvs.h"
+#include "esp_check.h"
 #include "wifi_config.h"
 
 #define TAG          "wcfg"
