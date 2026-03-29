@@ -17,6 +17,7 @@
 #include "cmd_system.h"
 #include "iperf3_server.h"
 #include "wifi_config.h"
+#include "oled.h"
 
 static const char *TAG = "wt32";
 
@@ -48,6 +49,9 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
              IP2STR(&event->ip_info.ip),
              IP2STR(&event->ip_info.netmask),
              IP2STR(&event->ip_info.gw));
+    char ip_str[20];
+    snprintf(ip_str, sizeof(ip_str), IPSTR, IP2STR(&event->ip_info.ip));
+    oled_set_eth_ip(ip_str);
 }
 
 /* Gibt den eth_netif-Handle zurueck, damit IP-Config angewandt werden kann */
@@ -80,6 +84,8 @@ static esp_netif_t *ethernet_init(void)
 
 void app_main(void)
 {
+    oled_init();
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());

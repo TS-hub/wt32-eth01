@@ -29,6 +29,7 @@
 #include "argtable3/argtable3.h"
 #include "cJSON.h"
 #include "iperf3_server.h"
+#include "oled.h"
 
 #define TAG "iperf3"
 
@@ -203,6 +204,7 @@ static void iperf3_server_task(void *arg)
         }
         cookie[IPERF3_COOKIE_SIZE - 1] = '\0';
         ESP_LOGI(TAG, "Cookie: %.36s", cookie);
+        oled_set_iperf3_active(true);
 
         /* --- 2. Send PARAM_EXCHANGE, receive JSON params from client --- */
         if (send_state(ctrl_fd, ST_PARAM_EXCHANGE) != 1) goto close_session;
@@ -532,6 +534,7 @@ close_session:
         n_data = 0;
         if (ctrl_fd >= 0) { close(ctrl_fd); ctrl_fd = -1; }
         if (buf) { free(buf); buf = NULL; }
+        oled_set_iperf3_active(false);
         ESP_LOGI(TAG, "Session closed, waiting for next client");
     }
 
