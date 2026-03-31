@@ -1,6 +1,7 @@
 build/
 managed_components/
 sdkconfig
+dependencies.lock
 .claude/
 .vscode/
 __pycache__/
