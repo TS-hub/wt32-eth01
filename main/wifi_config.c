@@ -12,12 +12,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "esp_random.h"
+#include "cJSON.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -160,6 +164,221 @@ static void get_eth_ip_str(char *buf, size_t len)
 }
 
 /* ------------------------------------------------------------------ */
+/* Diagnose-Tools: Ping + iperf3-Client                                */
+/* ------------------------------------------------------------------ */
+
+static void run_ping(const char *ip_str, char *out, size_t outlen)
+{
+    struct sockaddr_in dst = { .sin_family = AF_INET };
+    if (!inet_aton(ip_str, &dst.sin_addr)) {
+        snprintf(out, outlen, "Ungueltige IP: %s", ip_str);
+        return;
+    }
+    int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (sock < 0) { snprintf(out, outlen, "socket: %s", strerror(errno)); return; }
+
+    struct timeval tv = { .tv_sec = 2 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    int received = 0;
+    int total_rtt = 0;
+
+    for (int i = 0; i < 4; i++) {
+        /* ICMP echo request: type(1)+code(1)+cksum(2)+id(2)+seq(2)+data(32) */
+        uint8_t pkt[40] = {};
+        pkt[0] = 8;                              /* echo request */
+        pkt[4] = 0x12; pkt[5] = 0x34;           /* id */
+        pkt[7] = (uint8_t)(i + 1);              /* seq */
+        memset(pkt + 8, 0xAB, 32);
+
+        uint32_t sum = 0;
+        for (int j = 0; j < 40; j += 2)
+            sum += ((uint32_t)pkt[j] << 8) | pkt[j + 1];
+        while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+        uint16_t ck = ~(uint16_t)sum;
+        pkt[2] = ck >> 8; pkt[3] = ck & 0xFF;
+
+        int64_t t0 = esp_timer_get_time();
+        sendto(sock, pkt, sizeof(pkt), 0, (struct sockaddr *)&dst, sizeof(dst));
+
+        uint8_t buf[128];
+        struct sockaddr_in from;
+        socklen_t flen = sizeof(from);
+        int n = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&from, &flen);
+        int rtt_ms = (int)((esp_timer_get_time() - t0) / 1000);
+
+        if (n >= 28 && buf[20] == 0) {   /* ICMP echo reply (type 0) */
+            received++;
+            total_rtt += rtt_ms;
+        }
+        if (i < 3) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    close(sock);
+
+    if (received > 0)
+        snprintf(out, outlen, "Ping %s: %d/4 ok, avg %d ms",
+                 ip_str, received, total_rtt / received);
+    else
+        snprintf(out, outlen, "Ping %s: keine Antwort (0/4)", ip_str);
+}
+
+/* iperf3 protocol state constants */
+#define I3_PARAM_EXCHANGE   9
+#define I3_CREATE_STREAMS   10
+#define I3_TEST_START       1
+#define I3_TEST_RUNNING     2
+#define I3_TEST_END         4
+#define I3_EXCHANGE_RESULTS 13
+
+static int wcfg_recv_exact(int fd, void *buf, int len)
+{
+    int done = 0;
+    while (done < len) {
+        int n = recv(fd, (uint8_t *)buf + done, len - done, 0);
+        if (n <= 0) return -1;
+        done += n;
+    }
+    return done;
+}
+
+static void run_iperf3_client(const char *ip_str, int duration, char *out, size_t outlen)
+{
+    /* Cookie: 36 printable chars + null */
+    char cookie[37];
+    static const char pool[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+    for (int i = 0; i < 36; i++)
+        cookie[i] = pool[esp_random() % (sizeof(pool) - 1)];
+    cookie[36] = '\0';
+
+    struct sockaddr_in srv = { .sin_family = AF_INET, .sin_port = htons(5201) };
+    if (!inet_aton(ip_str, &srv.sin_addr)) {
+        snprintf(out, outlen, "Ungueltige IP: %s", ip_str);
+        return;
+    }
+
+    struct timeval tv;
+    int ctrl = -1, data = -1;
+    uint64_t bytes_sent = 0;
+    int64_t  t_start = 0;
+    int8_t   state;
+
+    /* 1. Control socket */
+    ctrl = socket(AF_INET, SOCK_STREAM, 0);
+    if (ctrl < 0) goto fail;
+    tv = (struct timeval){ .tv_sec = 10 };
+    setsockopt(ctrl, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(ctrl, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(ctrl, (struct sockaddr *)&srv, sizeof(srv)) < 0) goto fail;
+
+    /* 2. Send cookie */
+    if (send(ctrl, cookie, 37, 0) != 37) goto fail;
+
+    /* 3. Receive PARAM_EXCHANGE */
+    if (wcfg_recv_exact(ctrl, &state, 1) != 1 || state != I3_PARAM_EXCHANGE) goto fail;
+
+    /* 4. Send JSON params */
+    {
+        cJSON *p = cJSON_CreateObject();
+        cJSON_AddTrueToObject(p,             "tcp");
+        cJSON_AddNumberToObject(p, "time",    duration);
+        cJSON_AddNumberToObject(p, "parallel", 1);
+        cJSON_AddNumberToObject(p, "len",     16384);
+        cJSON_AddNumberToObject(p, "omit",    0);
+        cJSON_AddNumberToObject(p, "interval", 1);
+        cJSON_AddFalseToObject(p,             "reverse");
+        char *js = cJSON_PrintUnformatted(p);
+        cJSON_Delete(p);
+        uint32_t jlen = htonl((uint32_t)strlen(js));
+        send(ctrl, &jlen, 4, 0);
+        send(ctrl, js, (int)strlen(js), 0);
+        free(js);
+    }
+
+    /* 5. Receive CREATE_STREAMS */
+    if (wcfg_recv_exact(ctrl, &state, 1) != 1 || state != I3_CREATE_STREAMS) goto fail;
+
+    /* 6. Data socket */
+    data = socket(AF_INET, SOCK_STREAM, 0);
+    if (data < 0) goto fail;
+    /* 100 ms send timeout — yields quickly when TCP window is full */
+    tv = (struct timeval){ .tv_usec = 100000 };
+    setsockopt(data, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    /* Disable Nagle for maximum throughput */
+    { int flag = 1; setsockopt(data, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag)); }
+    if (connect(data, (struct sockaddr *)&srv, sizeof(srv)) < 0) goto fail;
+    if (send(data, cookie, 37, 0) != 37) goto fail;
+
+    /* 7. Receive TEST_START + TEST_RUNNING */
+    tv = (struct timeval){ .tv_sec = 15 };
+    setsockopt(ctrl, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (wcfg_recv_exact(ctrl, &state, 1) != 1 || state != I3_TEST_START)   goto fail;
+    if (wcfg_recv_exact(ctrl, &state, 1) != 1 || state != I3_TEST_RUNNING) goto fail;
+
+    /* 8. Send data — loop is timer-controlled; EAGAIN/ETIMEDOUT = retry */
+    uint8_t *tx = malloc(16384);
+    if (!tx) goto fail;
+    memset(tx, 0xAB, 16384);
+    t_start = esp_timer_get_time();
+    int64_t t_end = t_start + (int64_t)duration * 1000000LL;
+    while (esp_timer_get_time() < t_end) {
+        int n = send(data, tx, 16384, 0);
+        if (n > 0) bytes_sent += (uint64_t)n;
+        else       vTaskDelay(1);  /* yield to lwIP on backpressure */
+    }
+    free(tx);
+    close(data); data = -1;
+
+    double dur  = (double)(esp_timer_get_time() - t_start) / 1e6;
+    double mbps = (bytes_sent * 8.0) / dur / 1e6;
+
+    /* 9. TEST_END on ctrl */
+    state = I3_TEST_END;
+    send(ctrl, &state, 1, 0);
+
+    /* 10. Complete EXCHANGE_RESULTS handshake */
+    tv = (struct timeval){ .tv_sec = 10 };
+    setsockopt(ctrl, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (wcfg_recv_exact(ctrl, &state, 1) == 1 && state == I3_EXCHANGE_RESULTS) {
+        /* Send client JSON */
+        cJSON *res = cJSON_CreateObject();
+        cJSON *sa  = cJSON_CreateArray();
+        cJSON *si  = cJSON_CreateObject();
+        cJSON_AddNumberToObject(si, "id", 1);
+        cJSON_AddNumberToObject(si, "bytes", (double)bytes_sent);
+        cJSON_AddNumberToObject(si, "retransmits", 0);
+        cJSON_AddItemToArray(sa, si);
+        cJSON_AddItemToObject(res, "streams", sa);
+        cJSON_AddNumberToObject(res, "cpu_util_total", 0.0);
+        char *js = cJSON_PrintUnformatted(res);
+        cJSON_Delete(res);
+        uint32_t jlen = htonl((uint32_t)strlen(js));
+        send(ctrl, &jlen, 4, 0);
+        send(ctrl, js, (int)strlen(js), 0);
+        free(js);
+
+        /* Drain server JSON */
+        uint32_t net_len;
+        if (wcfg_recv_exact(ctrl, &net_len, 4) == 4) {
+            uint32_t rlen = ntohl(net_len);
+            char *rbuf = malloc(rlen + 1);
+            if (rbuf) { wcfg_recv_exact(ctrl, rbuf, (int)rlen); free(rbuf); }
+        }
+        wcfg_recv_exact(ctrl, &state, 1);  /* DISPLAY_RESULTS */
+        wcfg_recv_exact(ctrl, &state, 1);  /* IPERF_DONE */
+    }
+
+    close(ctrl);
+    snprintf(out, outlen, "iperf3 -> %s: %.2f Mbit/s (%" PRIu64 " KB / %.1f s)",
+             ip_str, mbps, bytes_sent / 1024ULL, dur);
+    return;
+
+fail:
+    if (data >= 0) close(data);
+    if (ctrl >= 0) close(ctrl);
+    snprintf(out, outlen, "Fehler: %s", strerror(errno));
+}
+
+/* ------------------------------------------------------------------ */
 /* HTTP-Handler                                                         */
 /* ------------------------------------------------------------------ */
 
@@ -167,31 +386,46 @@ static const char HTML_TMPL[] =
     "<!DOCTYPE html><html><head>"
     "<meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<title>ETH Konfiguration</title>"
+    "<title>iperf Test Plug</title>"
     "<style>"
-    "body{font-family:sans-serif;max-width:400px;margin:2em auto;padding:0 1em;color:#222}"
-    "h2{margin-bottom:.5em}fieldset{border:1px solid #ccc;border-radius:4px;padding:.8em;margin:.8em 0}"
-    "legend{font-weight:bold}label{display:block;margin:6px 0}"
+    "body{font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em;color:#222}"
+    "h1{font-size:1.3em;margin:0 0 .2em}p.sub{color:#666;font-size:.85em;margin:0 0 1.2em}"
+    "h2{font-size:1em;margin:1.2em 0 .4em;text-transform:uppercase;letter-spacing:.05em;color:#555}"
+    "fieldset{border:1px solid #ddd;border-radius:4px;padding:.8em;margin:.6em 0}"
+    "legend{font-weight:bold;font-size:.9em}label{display:block;margin:6px 0;font-size:.93em}"
     "input[type=text]{width:100%%;padding:5px;box-sizing:border-box;border:1px solid #bbb;border-radius:3px}"
-    ".btn{background:#0055aa;color:#fff;border:none;padding:9px 18px;"
-    "border-radius:4px;cursor:pointer;width:100%%;margin-top:10px;font-size:1em}"
-    ".info{color:#666;font-size:.82em;margin-top:14px;border-top:1px solid #eee;padding-top:8px}"
+    ".btn{background:#0055aa;color:#fff;border:none;padding:8px 18px;"
+    "border-radius:4px;cursor:pointer;width:100%%;margin-top:8px;font-size:.95em}"
+    ".status{background:#f7f7f7;border:1px solid #eee;border-radius:4px;"
+    "padding:.6em .8em;font-size:.83em;color:#444;margin-bottom:1em}"
     "</style></head><body>"
-    "<h2>Ethernet IP-Konfiguration</h2>"
+    "<h1>iperf Test Plug</h1>"
+    "<p class='sub'>ESP32-S3-ETH &mdash; always-on iperf3 server on port 5201</p>"
+    "<div class='status'>Ethernet IP: <b>%s</b> &nbsp;|&nbsp; WiFi setup AP: <b>" AP_SSID "</b></div>"
+    "<h2>IP Configuration</h2>"
     "<form method='post' action='/save'>"
-    "<fieldset><legend>Modus</legend>"
-    "<label><input type='radio' name='mode' value='dhcp' %s> DHCP (automatisch)</label>"
-    "<label><input type='radio' name='mode' value='static' %s> Statische IP</label>"
+    "<fieldset><legend>Mode</legend>"
+    "<label><input type='radio' name='mode' value='dhcp' %s> DHCP &mdash; obtain address automatically</label>"
+    "<label><input type='radio' name='mode' value='static' %s> Static IP</label>"
     "</fieldset>"
-    "<fieldset><legend>Statische IP (nur bei Modus &quot;Statisch&quot;)</legend>"
-    "<label>IP-Adresse:<input type='text' name='ip' value='%s'></label>"
-    "<label>Subnetzmaske:<input type='text' name='mask' value='%s'></label>"
-    "<label>Gateway:<input type='text' name='gw' value='%s'></label>"
+    "<fieldset><legend>Static IP settings</legend>"
+    "<label>IP address<input type='text' name='ip' value='%s'></label>"
+    "<label>Subnet mask<input type='text' name='mask' value='%s'></label>"
+    "<label>Gateway<input type='text' name='gw' value='%s'></label>"
     "</fieldset>"
-    "<button class='btn' type='submit'>Speichern und Neustart</button>"
+    "<button class='btn' type='submit'>Save &amp; Reboot</button>"
     "</form>"
-    "<p class='info'>Aktuelle ETH-IP: <b>%s</b><br>"
-    "WLAN: <b>" AP_SSID "</b> &bull; Portal: 192.168.4.1</p>"
+    "<h2>Diagnostics</h2>"
+    "<form method='post' action='/ping'>"
+    "<fieldset><legend>Ping</legend>"
+    "<label>Target IP<input type='text' name='ip' placeholder='192.168.1.1'></label>"
+    "<button class='btn' type='submit'>Send 4 pings</button>"
+    "</fieldset></form>"
+    "<form method='post' action='/iperf' style='margin-top:.6em'>"
+    "<fieldset><legend>iperf3 client &mdash; run <code>iperf3 -s</code> on target first</legend>"
+    "<label>Target IP<input type='text' name='ip' placeholder='192.168.1.1'></label>"
+    "<button class='btn' type='submit'>Run iperf3 (5 s, TCP send)</button>"
+    "</fieldset></form>"
     "</body></html>";
 
 static esp_err_t handler_get(httpd_req_t *req)
@@ -200,14 +434,14 @@ static esp_err_t handler_get(httpd_req_t *req)
     char eth_ip[20];
     get_eth_ip_str(eth_ip, sizeof(eth_ip));
 
-    char *page = malloc(2048);
+    char *page = malloc(3072);
     if (!page) return ESP_ERR_NO_MEM;
 
-    snprintf(page, 2048, HTML_TMPL,
+    snprintf(page, 3072, HTML_TMPL,
+             eth_ip,
              cfg.use_static ? "" : "checked",   /* DHCP radio   */
              cfg.use_static ? "checked" : "",   /* Static radio */
-             cfg.ip, cfg.mask, cfg.gw,
-             eth_ip);
+             cfg.ip, cfg.mask, cfg.gw);
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
@@ -251,22 +485,86 @@ static esp_err_t handler_save(httpd_req_t *req)
     if (cfg.gw[0]   == '\0') strlcpy(cfg.gw,   "192.168.1.1",   sizeof(cfg.gw));
 
     if (cfg_save(&cfg) == ESP_OK) {
-        ESP_LOGI(TAG, "Konfiguration gespeichert: mode=%s ip=%s mask=%s gw=%s",
-                 cfg.use_static ? "statisch" : "DHCP",
+        ESP_LOGI(TAG, "Config saved: mode=%s ip=%s mask=%s gw=%s",
+                 cfg.use_static ? "static" : "dhcp",
                  cfg.ip, cfg.mask, cfg.gw);
     }
 
     static const char *OK_HTML =
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta http-equiv='refresh' content='3;url=/'>"
-        "</head><body style='font-family:sans-serif;max-width:400px;margin:2em auto;padding:0 1em'>"
-        "<h2>Gespeichert!</h2>"
-        "<p>Neustart in 3 Sekunden...</p>"
+        "<title>iperf Test Plug</title>"
+        "</head><body style='font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em'>"
+        "<h1 style='font-size:1.3em'>Saved</h1>"
+        "<p>Settings stored. Rebooting in 3 seconds&hellip;</p>"
         "</body></html>";
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, OK_HTML, HTTPD_RESP_USE_STRLEN);
 
     xTaskCreate(restart_delayed, "restart", 1024, NULL, 3, NULL);
+    return ESP_OK;
+}
+
+static const char RESULT_TMPL[] =
+    "<!DOCTYPE html><html><head>"
+    "<meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>iperf Test Plug</title>"
+    "<style>body{font-family:sans-serif;max-width:420px;margin:2em auto;padding:0 1em}"
+    "h1{font-size:1.3em}pre{background:#f4f4f4;padding:1em;border-radius:4px;"
+    "white-space:pre-wrap;word-break:break-all;font-size:.92em}"
+    "a{color:#0055aa}</style></head><body>"
+    "<h1>Result</h1><pre>%s</pre>"
+    "<a href='/'>&#8592; Back</a>"
+    "</body></html>";
+
+static esp_err_t handler_ping(httpd_req_t *req)
+{
+    int blen = req->content_len;
+    if (blen <= 0 || blen > 64) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body"); return ESP_FAIL;
+    }
+    char body[65] = {};
+    if (httpd_req_recv(req, body, blen) != blen) return ESP_FAIL;
+    body[blen] = '\0';
+
+    char ip[24] = {};
+    form_get(body, "ip", ip, sizeof(ip));
+
+    char result[128];
+    run_ping(ip, result, sizeof(result));
+
+    char *page = malloc(1024);
+    if (!page) return ESP_ERR_NO_MEM;
+    snprintf(page, 1024, RESULT_TMPL, result);
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+    free(page);
+    return ESP_OK;
+}
+
+static esp_err_t handler_iperf(httpd_req_t *req)
+{
+    int blen = req->content_len;
+    if (blen <= 0 || blen > 64) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad body"); return ESP_FAIL;
+    }
+    char body[65] = {};
+    if (httpd_req_recv(req, body, blen) != blen) return ESP_FAIL;
+    body[blen] = '\0';
+
+    char ip[24] = {};
+    form_get(body, "ip", ip, sizeof(ip));
+
+    char result[128];
+    run_iperf3_client(ip, 5, result, sizeof(result));
+
+    char *page = malloc(1024);
+    if (!page) return ESP_ERR_NO_MEM;
+    snprintf(page, 1024, RESULT_TMPL, result);
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+    free(page);
     return ESP_OK;
 }
 
@@ -389,7 +687,8 @@ static void http_server_init(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;
-    cfg.max_uri_handlers = 4;
+    cfg.max_uri_handlers = 6;
+    cfg.stack_size = 8192;
 
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &cfg) != ESP_OK) {
@@ -407,6 +706,16 @@ static void http_server_init(void)
         .method   = HTTP_POST,
         .handler  = handler_save,
     };
+    static const httpd_uri_t uri_ping = {
+        .uri      = "/ping",
+        .method   = HTTP_POST,
+        .handler  = handler_ping,
+    };
+    static const httpd_uri_t uri_iperf = {
+        .uri      = "/iperf",
+        .method   = HTTP_POST,
+        .handler  = handler_iperf,
+    };
     static const httpd_uri_t uri_wild = {
         .uri      = "/*",
         .method   = HTTP_GET,
@@ -415,6 +724,8 @@ static void http_server_init(void)
 
     httpd_register_uri_handler(server, &uri_get);
     httpd_register_uri_handler(server, &uri_save);
+    httpd_register_uri_handler(server, &uri_ping);
+    httpd_register_uri_handler(server, &uri_iperf);
     httpd_register_uri_handler(server, &uri_wild);
     ESP_LOGI(TAG, "HTTP-Server gestartet auf Port 80");
 }

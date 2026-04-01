@@ -22,3 +22,15 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=7168
 # FreeRTOS-Statistiken (für 'tasks'-Konsolenbefehl)
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+
+# Flash-Größe: 16 MB
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# Benutzerdefinierte Partitionstabelle (4 MB App)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# lwIP TCP: größerer Sendepuffer für iperf3-Client-Modus
+# Empfangsfenster bleibt bei Standard 5760 — größere Werte überlasten den W5500-MACRAW-Puffer (16 KB)
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
