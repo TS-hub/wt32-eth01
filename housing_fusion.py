@@ -1,5 +1,6 @@
 # iperf Test Plug — Fusion 360 housing script
 # Waveshare ESP32-S3-ETH (23 × 72 mm) + SH1106 1.3" OLED (35.6 × 33.6 mm PCB)
+# Version: 3
 #
 # Usage: Fusion 360 → Tools → Scripts and Add-Ins → Run → select this file
 # Creates two components: iperf_body and iperf_lid, placed side-by-side.
@@ -147,37 +148,45 @@ def run(context):
         e2 = extrude(bc, sk2.profiles.item(0), inner_h, CUT, NEG)
         e2.name = "inner_cavity"
 
-        # 3 — RJ45 cutout: sketch on XZ plane (front face, y=0), extrude in +Y
-        sk3 = bsk.add(bc.xZConstructionPlane)
+        # 3 — RJ45 cutout: slot on front face (y=0 wall, 2 mm thick)
+        #     Approach: sketch on XY-offset plane at z=rj45_z_abs, draw a rectangle
+        #     that spans x=rj45 width and y=-1..wall+2 (straddles the front wall),
+        #     then extrude CUT in +Z by rj45_h.  Uses only the +Z axis which is
+        #     confirmed working — avoids XZ-plane coordinate-mapping ambiguity.
+        bplanes = bc.constructionPlanes
+        rj45_x   = (outer_w - rj45_w) / 2
+        rj45_z_abs = pcb_bot + rj45_z   # z of bottom edge of opening = 5.0 mm
+
+        rj45PlaneInp = bplanes.createInput()
+        rj45PlaneInp.setByOffset(bc.xYConstructionPlane,
+            adsk.core.ValueInput.createByReal(rj45_z_abs * m))
+        rj45Plane = bplanes.add(rj45PlaneInp)
+        rj45Plane.name = "rj45_base_plane"
+
+        sk3 = bsk.add(rj45Plane)
         sk3.name = "rj45_profile"
-        rj45_x = (outer_w - rj45_w) / 2
-        rj45_z_abs = pcb_bot + rj45_z
         sk3.sketchCurves.sketchLines.addTwoPointRectangle(
-            adsk.core.Point3D.create(rj45_x*m, rj45_z_abs*m, 0),
-            adsk.core.Point3D.create((rj45_x+rj45_w)*m, (rj45_z_abs+rj45_h)*m, 0))
-        # XZ plane normal = -Y  →  NEG direction = +Y (into body from front face)
-        e3 = extrude(bc, sk3.profiles.item(0), wall + 2, CUT, NEG)
+            adsk.core.Point3D.create( rj45_x        *m, -1      *m, 0),
+            adsk.core.Point3D.create((rj45_x+rj45_w)*m, (wall+2)*m, 0))
+        e3 = extrude(bc, sk3.profiles.item(0), rj45_h, CUT, POS)
         e3.name = "rj45_cutout"
 
-        # 4 — USB-C cutout: offset plane at y=outer_l, extrude in -Y
-        #     setByOffset moves along the plane's positive normal (-Y for XZ plane),
-        #     so a negative offset value moves in +Y, placing the plane at y = +outer_l.
-        bplanes = bc.constructionPlanes
-        backInp = bplanes.createInput()
-        backInp.setByOffset(bc.xZConstructionPlane,
-            adsk.core.ValueInput.createByReal(-outer_l * m))
-        backPlane = bplanes.add(backInp)
-        backPlane.name = "back_face_plane"
+        # 4 — USB-C cutout: same technique on back face (y=outer_l wall)
+        usbc_x   = (outer_w - usbc_w) / 2
+        usbc_z_abs = pcb_bot + usbc_z   # z of bottom edge of opening = 5.5 mm
 
-        sk4 = bsk.add(backPlane)
+        usbcPlaneInp = bplanes.createInput()
+        usbcPlaneInp.setByOffset(bc.xYConstructionPlane,
+            adsk.core.ValueInput.createByReal(usbc_z_abs * m))
+        usbcPlane = bplanes.add(usbcPlaneInp)
+        usbcPlane.name = "usbc_base_plane"
+
+        sk4 = bsk.add(usbcPlane)
         sk4.name = "usbc_profile"
-        usbc_x = (outer_w - usbc_w) / 2
-        usbc_z_abs = pcb_bot + usbc_z
         sk4.sketchCurves.sketchLines.addTwoPointRectangle(
-            adsk.core.Point3D.create(usbc_x*m, usbc_z_abs*m, 0),
-            adsk.core.Point3D.create((usbc_x+usbc_w)*m, (usbc_z_abs+usbc_h)*m, 0))
-        # POS = -Y from back plane → cuts into body toward front
-        e4 = extrude(bc, sk4.profiles.item(0), wall + 2, CUT, POS)
+            adsk.core.Point3D.create( usbc_x        *m, (outer_l-wall-2)*m, 0),
+            adsk.core.Point3D.create((usbc_x+usbc_w)*m, (outer_l+1)    *m, 0))
+        e4 = extrude(bc, sk4.profiles.item(0), usbc_h, CUT, POS)
         e4.name = "usbc_cutout"
 
         # 5 — Board standoff posts: 4 circles on floor plane, extruded up
