@@ -155,14 +155,17 @@ def run(context):
         sk3.sketchCurves.sketchLines.addTwoPointRectangle(
             adsk.core.Point3D.create(rj45_x*m, rj45_z_abs*m, 0),
             adsk.core.Point3D.create((rj45_x+rj45_w)*m, (rj45_z_abs+rj45_h)*m, 0))
-        e3 = extrude(bc, sk3.profiles.item(0), wall + 2, CUT, POS)
+        # XZ plane normal = -Y  →  NEG direction = +Y (into body from front face)
+        e3 = extrude(bc, sk3.profiles.item(0), wall + 2, CUT, NEG)
         e3.name = "rj45_cutout"
 
         # 4 — USB-C cutout: offset plane at y=outer_l, extrude in -Y
+        #     setByOffset moves along the plane's positive normal (-Y for XZ plane),
+        #     so a negative offset value moves in +Y, placing the plane at y = +outer_l.
         bplanes = bc.constructionPlanes
         backInp = bplanes.createInput()
         backInp.setByOffset(bc.xZConstructionPlane,
-            adsk.core.ValueInput.createByReal(outer_l * m))
+            adsk.core.ValueInput.createByReal(-outer_l * m))
         backPlane = bplanes.add(backInp)
         backPlane.name = "back_face_plane"
 
@@ -173,7 +176,8 @@ def run(context):
         sk4.sketchCurves.sketchLines.addTwoPointRectangle(
             adsk.core.Point3D.create(usbc_x*m, usbc_z_abs*m, 0),
             adsk.core.Point3D.create((usbc_x+usbc_w)*m, (usbc_z_abs+usbc_h)*m, 0))
-        e4 = extrude(bc, sk4.profiles.item(0), wall + 2, CUT, NEG)
+        # POS = -Y from back plane → cuts into body toward front
+        e4 = extrude(bc, sk4.profiles.item(0), wall + 2, CUT, POS)
         e4.name = "usbc_cutout"
 
         # 5 — Board standoff posts: 4 circles on floor plane, extruded up
