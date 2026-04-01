@@ -1,6 +1,6 @@
 # iperf Test Plug — Fusion 360 housing script
 # Waveshare ESP32-S3-ETH (23 × 72 mm) + SH1106 1.3" OLED (35.6 × 33.6 mm PCB)
-# Version: 4
+# Version: 5
 #
 # Usage: Fusion 360 → Tools → Scripts and Add-Ins → Run → select this file
 # Creates two components: iperf_body and iperf_lid, placed side-by-side.
@@ -326,27 +326,34 @@ def run(context):
         le5 = extrude_profiles(lc_comp, hole_profs, post_h + lid_top, CUT, NEG)
         le5.name = "screw_pilot_holes"
 
-        # 6 — Label embossed on top (optional — comment out if text is slow)
-        #     Use a construction plane at z=lid_top rather than top_face_lid,
-        #     which is stale after the screen-window cut modified the face topology.
-        labelPlaneInp = lpl.createInput()
-        labelPlaneInp.setByOffset(lc_comp.xYConstructionPlane,
-            adsk.core.ValueInput.createByReal(lid_top * m))
-        labelPlane = lpl.add(labelPlaneInp)
-        label_sk = lsk.add(labelPlane)
-        label_sk.name = "label"
-        txt = label_sk.sketchTexts
-        txtInp = txt.createInput2("iperf test plug", 3.5 * m)
-        txtInp.setAsMultiLine(
-            adsk.core.Point3D.create((outer_w/2)*m, (outer_l - wall - 7)*m, 0),
-            adsk.core.Point3D.create((outer_w/2 + 30)*m, (outer_l - wall - 7)*m, 0),
-            adsk.fusion.HorizontalAlignments.CenterHorizontalAlignment,
-            adsk.fusion.VerticalAlignments.MiddleVerticalAlignment, 0)
-        txt.add(txtInp)
-        label_profs = [label_sk.profiles.item(i) for i in range(label_sk.profiles.count)]
-        if label_profs:
-            le6 = extrude_profiles(lc_comp, label_profs, 0.4, CUT, NEG)
-            le6.name = "label_engraved"
+        # 6 — Label embossed on top (optional — skipped silently on API errors)
+        try:
+            labelPlaneInp = lpl.createInput()
+            labelPlaneInp.setByOffset(lc_comp.xYConstructionPlane,
+                adsk.core.ValueInput.createByReal(lid_top * m))
+            labelPlane = lpl.add(labelPlaneInp)
+            label_sk = lsk.add(labelPlane)
+            label_sk.name = "label"
+            txt = label_sk.sketchTexts
+            txtInp = txt.createInput2("iperf test plug", 3.5 * m)
+            # HorizontalAlignments / VerticalAlignments enum path differs by API version
+            try:
+                h_ctr = adsk.fusion.HorizontalAlignments.CenterHorizontalAlignment
+                v_mid = adsk.fusion.VerticalAlignments.MiddleVerticalAlignment
+            except AttributeError:
+                h_ctr = adsk.core.HorizontalAlignments.CenterHorizontalAlignment
+                v_mid = adsk.core.VerticalAlignments.MiddleVerticalAlignment
+            txtInp.setAsMultiLine(
+                adsk.core.Point3D.create((outer_w/2)*m, (outer_l - wall - 7)*m, 0),
+                adsk.core.Point3D.create((outer_w/2 + 30)*m, (outer_l - wall - 7)*m, 0),
+                h_ctr, v_mid, 0)
+            txt.add(txtInp)
+            label_profs = [label_sk.profiles.item(i) for i in range(label_sk.profiles.count)]
+            if label_profs:
+                le6 = extrude_profiles(lc_comp, label_profs, 0.4, CUT, NEG)
+                le6.name = "label_engraved"
+        except Exception:
+            pass  # label is cosmetic — continue without it
 
         # ── Done ─────────────────────────────────────────────────────────────
         des.designType = adsk.fusion.DesignTypes.ParametricDesignType
