@@ -1,6 +1,6 @@
 # iperf Test Plug — Fusion 360 housing script
 # Waveshare ESP32-S3-ETH (23 × 72 mm) + SH1106 1.3" OLED (35.6 × 33.6 mm PCB)
-# Version: 5
+# Version: 6
 #
 # Usage: Fusion 360 → Tools → Scripts and Add-Ins → Run → select this file
 # Creates two components: iperf_body and iperf_lid, placed side-by-side.
@@ -137,10 +137,17 @@ def run(context):
         e1 = extrude(bc, sk1.profiles.item(0), body_h, NEW)
         e1.name = "body_shell"
 
-        # 2 — Inner cavity: rectangle cut from top face downward by inner_h
-        #     Leaves floor_t = 1.5 mm floor
-        top_face = e1.endFaces.item(0)
-        sk2 = bsk.add(top_face)
+        # 2 — Inner cavity: sketch on a construction plane at z=body_h (top of shell).
+        #     Using a construction plane (not the top face) creates exactly ONE profile
+        #     (the rectangle), avoiding the face's outer-annular-region ambiguity.
+        bplanes = bc.constructionPlanes
+        topPlaneInp = bplanes.createInput()
+        topPlaneInp.setByOffset(bc.xYConstructionPlane,
+            adsk.core.ValueInput.createByReal(body_h * m))
+        topPlane = bplanes.add(topPlaneInp)
+        topPlane.name = "body_top_plane"
+
+        sk2 = bsk.add(topPlane)
         sk2.name = "inner_cavity"
         sk2.sketchCurves.sketchLines.addTwoPointRectangle(
             adsk.core.Point3D.create(wall*m, wall*m, 0),
@@ -149,11 +156,6 @@ def run(context):
         e2.name = "inner_cavity"
 
         # 3 — RJ45 cutout: slot on front face (y=0 wall, 2 mm thick)
-        #     Approach: sketch on XY-offset plane at z=rj45_z_abs, draw a rectangle
-        #     that spans x=rj45 width and y=-1..wall+2 (straddles the front wall),
-        #     then extrude CUT in +Z by rj45_h.  Uses only the +Z axis which is
-        #     confirmed working — avoids XZ-plane coordinate-mapping ambiguity.
-        bplanes = bc.constructionPlanes
         rj45_x   = (outer_w - rj45_w) / 2
         rj45_z_abs = pcb_bot + rj45_z   # z of bottom edge of opening = 5.0 mm
 
@@ -171,9 +173,13 @@ def run(context):
         e3 = extrude(bc, sk3.profiles.item(0), rj45_h, CUT, POS)
         e3.name = "rj45_cutout"
 
-        # 4 — USB-C cutout: same technique on back face (y=outer_l wall)
-        usbc_x   = (outer_w - usbc_w) / 2
-        usbc_z_abs = pcb_bot + usbc_z   # z of bottom edge of opening = 5.5 mm
+        # 4 — USB-C cutout: SAME front face (y=0) as RJ45, below PCB level.
+        #     The USB-C is mounted on the underside of the PCB; its connector body
+        #     occupies the space between the floor (z=floor_t) and the PCB bottom
+        #     (z=pcb_bot).  Opening height = standoff = pcb_bot - floor_t = 3.5 mm.
+        usbc_x     = (outer_w - usbc_w) / 2
+        usbc_z_abs = floor_t          # slot starts at top of floor
+        usbc_h_slot = standoff        # slot height fills space below PCB
 
         usbcPlaneInp = bplanes.createInput()
         usbcPlaneInp.setByOffset(bc.xYConstructionPlane,
@@ -184,9 +190,9 @@ def run(context):
         sk4 = bsk.add(usbcPlane)
         sk4.name = "usbc_profile"
         sk4.sketchCurves.sketchLines.addTwoPointRectangle(
-            adsk.core.Point3D.create( usbc_x        *m, (outer_l-wall-2)*m, 0),
-            adsk.core.Point3D.create((usbc_x+usbc_w)*m, (outer_l+1)    *m, 0))
-        e4 = extrude(bc, sk4.profiles.item(0), usbc_h, CUT, POS)
+            adsk.core.Point3D.create( usbc_x        *m, -m, 0),
+            adsk.core.Point3D.create((usbc_x+usbc_w)*m, (wall+2)*m, 0))
+        e4 = extrude(bc, sk4.profiles.item(0), usbc_h_slot, CUT, POS)
         e4.name = "usbc_cutout"
 
         # 5 — Board standoff posts: 4 circles on floor plane, extruded up
@@ -244,56 +250,53 @@ def run(context):
         lft = lc_comp.features
         lpl = lc_comp.constructionPlanes
 
-        # 1 — Top plate: rounded rectangle extruded by lid_top
+        # All lid features use construction planes anchored to lc_comp.xYConstructionPlane
+        # (Z=0 = underside of lid plate; Z=+lid_top = outer/top face).
+        # No face references — they go stale after each operation.
+
+        # 1 — Top plate: rounded rectangle on XY plane, extruded up by lid_top
         lsk1 = lsk.add(lc_comp.xYConstructionPlane)
         lsk1.name = "lid_outer_profile"
         add_rrect(lsk1, 0, 0, outer_w, outer_l, corner_r)
         le1 = extrude(lc_comp, lsk1.profiles.item(0), lid_top, NEW)
         le1.name = "lid_plate"
 
-        # 2 — Press-fit rim: hollow rectangle extruded downward from underside
-        #     Clearance rim_lc on each side; rim wall thickness rim_t
-        rim_ox = wall + rim_lc           # outer rim X start
-        rim_oy = wall + rim_lc           # outer rim Y start
-        rim_ow = inner_w - 2*rim_lc      # outer rim width
-        rim_ol = inner_l - 2*rim_lc      # outer rim length
-        rim_ix = rim_ox + rim_t          # inner cutout X start
+        # 2 — Press-fit rim: two-step to avoid multi-profile ambiguity.
+        #     2a: solid outer rim block (JOI, NEG = downward from Z=0)
+        #     2b: hollow out the interior (CUT, NEG)
+        rim_ox = wall + rim_lc
+        rim_oy = wall + rim_lc
+        rim_ow = inner_w - 2*rim_lc
+        rim_ol = inner_l - 2*rim_lc
+        rim_ix = rim_ox + rim_t
         rim_iy = rim_oy + rim_t
         rim_iw = rim_ow - 2*rim_t
         rim_il = rim_ol - 2*rim_t
 
-        bot_face = le1.startFaces.item(0)
-        lsk2 = lsk.add(bot_face)
-        lsk2.name = "rim_profile"
-        ln2 = lsk2.sketchCurves.sketchLines
-        # Outer rim rectangle
-        ln2.addTwoPointRectangle(
+        lsk2a = lsk.add(lc_comp.xYConstructionPlane)
+        lsk2a.name = "rim_outer"
+        lsk2a.sketchCurves.sketchLines.addTwoPointRectangle(
             adsk.core.Point3D.create(rim_ox*m, rim_oy*m, 0),
             adsk.core.Point3D.create((rim_ox+rim_ow)*m, (rim_oy+rim_ol)*m, 0))
-        # Inner cutout rectangle (creates the hollow cross-section)
-        ln2.addTwoPointRectangle(
+        le2a = extrude(lc_comp, lsk2a.profiles.item(0), rim_ins, JOI, NEG)
+        le2a.name = "rim_solid"
+
+        lsk2b = lsk.add(lc_comp.xYConstructionPlane)
+        lsk2b.name = "rim_inner_cut"
+        lsk2b.sketchCurves.sketchLines.addTwoPointRectangle(
             adsk.core.Point3D.create(rim_ix*m, rim_iy*m, 0),
             adsk.core.Point3D.create((rim_ix+rim_iw)*m, (rim_iy+rim_il)*m, 0))
-        # The profile between the two rectangles is the rim cross-section
-        # Fusion 360 auto-selects the enclosed region between outer and inner rects
-        rim_prof = None
-        for i in range(lsk2.profiles.count):
-            p = lsk2.profiles.item(i)
-            # The rim profile area ≈ rim_ow*rim_ol - rim_iw*rim_il
-            rim_area = p.areaProperties().area
-            expected = (rim_ow * rim_ol - rim_iw * rim_il) * m * m
-            if abs(rim_area - expected) < expected * 0.2:
-                rim_prof = p
-                break
-        if rim_prof is None:
-            rim_prof = lsk2.profiles.item(0)  # fallback
+        le2b = extrude(lc_comp, lsk2b.profiles.item(0), rim_ins + 0.1, CUT, NEG)
+        le2b.name = "rim_hollow"
 
-        le2 = extrude(lc_comp, rim_prof, rim_ins, JOI, NEG)
-        le2.name = "press_fit_rim"
+        # 3 — Screen window: offset plane at z=lid_top, cut down through full plate
+        scrPlaneInp = lpl.createInput()
+        scrPlaneInp.setByOffset(lc_comp.xYConstructionPlane,
+            adsk.core.ValueInput.createByReal(lid_top * m))
+        scrPlane = lpl.add(scrPlaneInp)
+        scrPlane.name = "lid_top_plane"
 
-        # 3 — Screen window: rectangle cut through lid plate
-        top_face_lid = le1.endFaces.item(0)
-        lsk3 = lsk.add(top_face_lid)
+        lsk3 = lsk.add(scrPlane)
         lsk3.name = "screen_window"
         lsk3.sketchCurves.sketchLines.addTwoPointRectangle(
             adsk.core.Point3D.create((wall+scr_xo)*m, (wall+scr_yo)*m, 0),
@@ -301,11 +304,11 @@ def run(context):
         le3 = extrude(lc_comp, lsk3.profiles.item(0), lid_top + 0.1, CUT, NEG)
         le3.name = "screen_window"
 
-        # 4 — Display mounting posts: circles on underside, extruded downward (into body)
-        lsk4 = lsk.add(bot_face)
+        # 4 — Display mounting posts: circles on XY plane, extruded downward (NEG)
+        lsk4 = lsk.add(lc_comp.xYConstructionPlane)
         lsk4.name = "post_circles"
         lcirc = lsk4.sketchCurves.sketchCircles
-        post_outer_r = dm_hd / 2 + 1.2   # post outer radius (for M3 self-tapping)
+        post_outer_r = dm_hd / 2 + 1.2
         for hx, hy in holes:
             lcirc.addByCenterRadius(
                 adsk.core.Point3D.create(hx*m, hy*m, 0), post_outer_r*m)
@@ -314,13 +317,13 @@ def run(context):
         le4 = extrude_profiles(lc_comp, post_lid_profs, post_h, JOI, NEG)
         le4.name = "display_posts"
 
-        # 5 — M3 pilot holes through posts (2.5 mm dia, self-tapping)
-        lsk5 = lsk.add(bot_face)
+        # 5 — M3 pilot holes through posts and plate (2.5 mm dia)
+        lsk5 = lsk.add(lc_comp.xYConstructionPlane)
         lsk5.name = "screw_holes"
         lcirc5 = lsk5.sketchCurves.sketchCircles
         for hx, hy in holes:
             lcirc5.addByCenterRadius(
-                adsk.core.Point3D.create(hx*m, hy*m, 0), 1.25*m)  # r = 1.25 mm
+                adsk.core.Point3D.create(hx*m, hy*m, 0), 1.25*m)
 
         hole_profs = [lsk5.profiles.item(i) for i in range(lsk5.profiles.count)]
         le5 = extrude_profiles(lc_comp, hole_profs, post_h + lid_top, CUT, NEG)
