@@ -12,6 +12,8 @@ ESP-IDF firmware for the [Waveshare ESP32-S3-ETH](https://www.waveshare.com/wiki
 
 ## Hardware
 
+![Waveshare ESP32-S3-ETH board](ESP32-S3-ETH-details-15.jpg)
+
 | Board | Waveshare ESP32-S3-ETH |
 |-------|------------------------|
 | SoC | ESP32-S3 (dual-core, 240 MHz) |
@@ -114,6 +116,24 @@ Throughput is limited by the W5500's SPI interface at 25 MHz:
 | `iperf3 -c <ip> -P4` | ~8–9 Mbit/s |
 
 The W5500 has a 16 KB per-socket RX buffer; with 4 parallel streams TCP congestion windows shrink on the weaker streams.
+
+## Housing
+
+A 3D-printable enclosure for the board + 1.3" OLED display is designed in Fusion 360.
+
+| File | Description |
+|------|-------------|
+| `housing_fusion.py` | Fusion 360 Python API script — generates parametric body + lid components |
+| `housing.scad` | OpenSCAD version of the same geometry |
+
+### Design overview
+
+- **Body**: shell with 2 mm walls, 1.5 mm floor; RJ45 and USB-C cutouts on the front face; 4 standoff posts (3.5 mm) for the PCB; two guide rails to seat the board
+- **Lid**: top plate (3 mm) with press-fit rim (5 mm), screen window cutout for the OLED, and 4 display mounting posts with M3 pilot holes (1.25 mm radius)
+
+To run the script: open Fusion 360 → **Tools → Add-Ins → Scripts** → add `housing_fusion.py` → Run in a *New Design* (not a Part Design).
+
+> **Status:** Work in progress — dimensions still being dialled in. STEP export, print-ready STLs, and a rendered image will be added once the fit is confirmed.
 
 ## Project Structure
 
