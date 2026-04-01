@@ -1,6 +1,6 @@
 # iperf Test Plug — Fusion 360 housing script
 # Waveshare ESP32-S3-ETH (23 × 72 mm) + SH1106 1.3" OLED (35.6 × 33.6 mm PCB)
-# Version: 3
+# Version: 4
 #
 # Usage: Fusion 360 → Tools → Scripts and Add-Ins → Run → select this file
 # Creates two components: iperf_body and iperf_lid, placed side-by-side.
@@ -327,7 +327,13 @@ def run(context):
         le5.name = "screw_pilot_holes"
 
         # 6 — Label embossed on top (optional — comment out if text is slow)
-        label_sk = lsk.add(top_face_lid)
+        #     Use a construction plane at z=lid_top rather than top_face_lid,
+        #     which is stale after the screen-window cut modified the face topology.
+        labelPlaneInp = lpl.createInput()
+        labelPlaneInp.setByOffset(lc_comp.xYConstructionPlane,
+            adsk.core.ValueInput.createByReal(lid_top * m))
+        labelPlane = lpl.add(labelPlaneInp)
+        label_sk = lsk.add(labelPlane)
         label_sk.name = "label"
         txt = label_sk.sketchTexts
         txtInp = txt.createInput2("iperf test plug", 3.5 * m)
